@@ -6,67 +6,113 @@ allowed-tools: WebFetch, WebSearch
 
 # Refresh Games
 
-Scrape ESPN for today's games, odds, and injuries across all sports (NBA, NHL, NFL, NCAAB).
+Trigger the refresh-odds Edge Function or manually scrape ESPN JSON APIs for games, odds, and injuries.
 
 ## What This Skill Does
 
-1. Fetches today's odds from ESPN for each sport
-2. Fetches injury reports from ESPN for each sport
-3. Parses the data into structured format
-4. Updates Supabase `games` table with odds + injuries
+1. Calls the `refresh-odds` Edge Function (preferred)
+2. Falls back to ESPN JSON API scraping if needed
+3. Updates Supabase with games, odds, injuries, and line movement
 
-## ESPN URLs to Scrape
+## Primary Method: Edge Function
 
-### Odds Pages
-- NBA: `https://www.espn.com/nba/odds`
-- NHL: `https://www.espn.com/nhl/odds`
-- NFL: `https://www.espn.com/nfl/odds`
-- NCAAB: `https://www.espn.com/mens-college-basketball/odds`
+The system now runs automated scheduled refreshes via pg_cron. For manual override:
 
-### Injury Pages
+```bash
+# Call the Edge Function directly
+curl -X POST https://htnhszioyydsjzkqeowx.supabase.co/functions/v1/refresh-odds \
+  -H "Content-Type: application/json" \
+  -d '{"tier": "all", "force": true}'
+```
+
+Options:
+- `tier`: "opening" | "72hr" | "24hr" | "6hr" | "gameday" | "all"
+- `force`: true to skip schedule checks
+- `sport`: "NBA" | "NHL" | "NFL" | "NCAAB" (optional, defaults to all)
+
+## Automated Schedule (pg_cron)
+
+The Edge Function runs automatically on this schedule:
+
+| Job | Frequency | Purpose |
+|-----|-----------|---------|
+| refresh-opening-lines | Daily 9am UTC | Discover games 3-7 days out |
+| refresh-72hr | Every 6 hours | Games 2-3 days out |
+| refresh-24hr | Every 2 hours | Games tomorrow |
+| refresh-gameday | Every 30 min | Today's games |
+| settle-games | 8pm/10pm/midnight UTC | Settlement check |
+
+## ESPN JSON APIs (Fallback)
+
+If Edge Function fails, use these endpoints:
+
+### Scoreboard (get event IDs)
+```
+https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard?dates=YYYYMMDD
+```
+
+| Sport | Path |
+|-------|------|
+| NBA | basketball/nba |
+| NHL | hockey/nhl |
+| NFL | football/nfl |
+| NCAAB | basketball/mens-college-basketball |
+
+### Odds (per event)
+```
+https://sports.core.api.espn.com/v2/sports/{sport}/leagues/{league}/events/{EVENT_ID}/competitions/{EVENT_ID}/odds
+```
+
+Returns structured JSON with:
+- Current spread, total, moneylines
+- Opening lines for line movement tracking
+
+### Injuries (HTML scrape still required)
 - NBA: `https://www.espn.com/nba/injuries`
 - NHL: `https://www.espn.com/nhl/injuries`
 - NFL: `https://www.espn.com/nfl/injuries`
 - NCAAB: `https://www.espn.com/mens-college-basketball/injuries`
 
-## Data Format
+## Data Flow
 
-For each game, extract:
-- `sport`: NBA, NHL, NFL, or NCAAB
-- `game_date`: Today's date
-- `game_time`: Game start time
-- `away_team`: Away team name
-- `home_team`: Home team name
-- `away_ml`: Away moneyline (integer, e.g., -155 or +130)
-- `home_ml`: Home moneyline
-- `spread`: Point spread (positive = home favored)
-- `total`: Over/under
-- `injuries`: JSONB with format `{"away": ["Player (Status)"], "home": ["Player (Status)"]}`
+```
+ESPN JSON APIs → Edge Function → Supabase Tables
+                                 ├── games (+ espn_event_id)
+                                 ├── game_odds (current)
+                                 ├── odds_history (snapshots)
+                                 └── game_injuries
+```
 
-## Supabase Update
+## Checking Cron Status
 
-Use upsert logic to update existing games or insert new ones:
-
+View cron job status:
 ```sql
-INSERT INTO games (sport, game_date, game_time, away_team, home_team, away_ml, home_ml, spread, total, injuries, book)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, 'ESPN/DraftKings')
-ON CONFLICT (sport, game_date, away_team, home_team)
-DO UPDATE SET
-  away_ml = EXCLUDED.away_ml,
-  home_ml = EXCLUDED.home_ml,
-  spread = EXCLUDED.spread,
-  total = EXCLUDED.total,
-  injuries = EXCLUDED.injuries;
+SELECT * FROM cron_job_status;
+```
+
+View recent runs:
+```sql
+SELECT * FROM cron.job_run_details
+ORDER BY start_time DESC
+LIMIT 10;
 ```
 
 ## Output
 
-Return a summary of games refreshed:
+Return a summary:
 ```
-Refreshed games for 2025-12-29:
-- NBA: 11 games
-- NHL: 11 games
-- NFL: 1 game
-- NCAAB: 7 games
-Total: 30 games with odds and injuries
+## Refresh Complete
+
+**Method**: Edge Function (refresh-odds)
+**Tier**: gameday
+
+| Sport | Games | With Odds | Line Moves |
+|-------|-------|-----------|------------|
+| NBA   | 11    | 11        | 3          |
+| NHL   | 11    | 11        | 2          |
+| NFL   | 1     | 1         | 0          |
+| NCAAB | 7     | 7         | 1          |
+
+**Total**: 30 games refreshed
+**Next scheduled refresh**: 30 minutes
 ```

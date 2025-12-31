@@ -1,70 +1,103 @@
 ---
 name: predict
-description: Analyze today's games and make betting picks. Use when user says "predict games", "analyze today's slate", "make picks", or "find edges".
-allowed-tools: Read, WebSearch, WebFetch
+description: Analyze the next upcoming game and make a betting pick. Use when user says "predict games", "analyze today's slate", "make picks", or "find edges".
+allowed-tools: Read, WebSearch, WebFetch, Task
 ---
 
-# Predict Games
+# Predict Games (v8 - Simplified)
 
-Analyze today's games from Supabase and make betting picks based on public betting data, sharp action, and injury context.
+**Key principle:** Each game = fresh opus context. Full autonomy per game.
 
-## Prerequisites
-
-Run `/refresh-games` first to ensure Supabase has today's games with injuries.
-
-## What This Skill Does
-
-1. Queries Supabase for today's games (already includes odds and injuries)
-2. For each sport, delegates to sport-specific researcher agent
-3. Each researcher searches for public betting % and social sentiment
-4. Orchestrator verifies predictions and applies confidence thresholds
-5. Qualifying picks are inserted into `placed_bets` table
-
-## Workflow
+## Architecture
 
 ```
-/predict
+/predict (Lightweight Orchestrator - YOU)
     │
-    ├── Query Supabase (games + injuries)
+    ├── Step 1: Query all UNSTARTED games from Supabase
     │
-    ├── NBA games → nba-researcher agent
-    ├── NHL games → nhl-researcher agent
-    ├── NFL games → nfl-researcher agent
-    └── NCAAB games → ncaab-researcher agent
-         │
-         ├── public-betting skill (search Action Network, Covers)
-         └── social-sentiment skill (search X, Reddit)
-              │
-              └── Return structured predictions
-                   │
-                   └── Orchestrator verifies → Insert to placed_bets
+    └── Step 2: FOR EACH GAME:
+            └── Task(opus): game-predictor
+                ├── Receives: Full game data from Supabase
+                ├── Has: Full autonomy to research more if needed
+                ├── Writes: prediction_log + placed_bets (if BET)
+                └── Returns: Short summary
+
+        [CONTEXT DISCARDED - next game gets fresh opus]
 ```
 
-## Pass Criteria (v1)
+---
 
-- **PASS** if conflicting signals between sources
-- **PASS** if confidence < 60%
-- **PASS** if public betting data unavailable
-- **BET** if clear public fade opportunity (>65% public on one side with sharp action opposite)
+## Step 1: Query Games
 
-## Output
+Get all unstarted games:
+
+```sql
+SELECT *
+FROM game_analysis_view
+WHERE game_date >= CURRENT_DATE
+  AND game_time > NOW()
+ORDER BY game_time;
+```
+
+If no results: "No games to analyze. Run /refresh-games to update."
+
+---
+
+## Step 2: Spawn Game Predictors
+
+For EACH game, spawn a `game-predictor` agent:
 
 ```
-## Today's Picks (2025-12-29)
+Task(opus, subagent_type='game-predictor'):
 
-### NBA
-| Game | Pick | Type | Odds | Confidence | Reasoning |
-|------|------|------|------|------------|-----------|
-| HOU @ MIA | Heat +3.5 | Spread | -110 | 72% | 68% public on Rockets, sharps on Heat |
+Game: {away_team} @ {home_team}
+Sport: {sport}
+Date: {game_date}
+Time: {game_time}
 
-### NCAAB
-| Game | Pick | Type | Odds | Confidence | Reasoning |
-|------|------|------|------|------------|-----------|
-| Duke @ Wake | Wake +7.5 | Spread | -110 | 65% | Heavy public on Duke |
+GAME DATA FROM SUPABASE:
+{Full game JSON from game_analysis_view - odds, injuries, line_movement}
 
-### Passed Games
-- BOS @ CLE: No clear edge (public split 52/48)
-- LAL @ PHX: Conflicting signals
-
-Total: 2 picks placed, 28 games passed
+Make your decision. Write to database. Return a short summary.
 ```
+
+**CRITICAL:** Each game gets a FRESH agent. Do NOT batch games or pass previous game context.
+
+---
+
+## Step 3: Collect Summaries
+
+Display each game-predictor's summary to the user:
+
+```
+## Predictions
+
+### Game 1: DET @ LAL
+BET: DET -2.5 @ -108 (70% conf)
+Line moved: 1.5 → 2.5 | Injuries: LAL missing Reaves
+
+### Game 2: BOS @ UTA
+PASS: No edge - lines stable, no significant injuries
+
+### Game 3: ...
+```
+
+---
+
+## Token Budget
+
+| Component | Tokens | Accumulates? |
+|-----------|--------|--------------|
+| Orchestrator base | 2k | Once |
+| Per-game opus | 6-10k | **Discarded** |
+| Per-game summary | ~200 | Yes |
+| **10 games** | **~4k orchestrator** | Fresh per game |
+
+---
+
+## Notes
+
+- Each game-predictor has full autonomy to research (WebSearch, WebFetch) if needed
+- Public betting data is NOT pre-fetched; agents can research if they want
+- Games can be re-predicted (no UNIQUE constraint) - useful for line movement
+- Version: v8-simplified
