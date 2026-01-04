@@ -40,10 +40,12 @@ A hierarchical agent system for sports betting predictions using Claude Code ski
                                         │
                                         ▼ (pg_net HTTP)
                      ┌─────────────────────────────────────────┐
-                     │     EDGE FUNCTION: refresh-odds         │
+                     │     EDGE FUNCTION: refresh-odds (v12)   │
                      │  1. Fetch ESPN scoreboard (event IDs)   │
-                     │  2. Fetch ESPN odds API (JSON)          │
-                     │  3. Upsert game_odds + odds_history     │
+                     │  2. Fetch ESPN odds API (signed spread) │
+                     │  3. Fetch ESPN injuries API (JSON)      │
+                     │  4. Fetch DailyFaceoff goalies (NHL)    │
+                     │  5. Upsert all data atomically          │
                      └─────────────────────────────────────────┘
                                         │
                                         ▼
@@ -52,7 +54,9 @@ A hierarchical agent system for sports betting predictions using Claude Code ski
                      │  ├── games (+ espn_event_id)            │
                      │  ├── game_odds (current lines)          │
                      │  ├── odds_history (line movement)       │
-                     │  └── game_injuries                      │
+                     │  ├── game_injuries (linked to games)    │
+                     │  ├── injury_history (status tracking)   │
+                     │  └── game_goalies (NHL starters)        │
                      └─────────────────────────────────────────┘
 
 ═══════════════════════════════════════════════════════════════════
@@ -63,23 +67,31 @@ A hierarchical agent system for sports betting predictions using Claude Code ski
                                         (force refresh, bypass schedule)
 
 ═══════════════════════════════════════════════════════════════════
-                    PREDICTION (Isolated Opus per Game)
+                    PREDICTION (Split Agents)
 ═══════════════════════════════════════════════════════════════════
 
 /predict (Lightweight Orchestrator)
     │
-    ├── Query all UNSTARTED games from Supabase
+    ├── Query TODAY's games from game_analysis_view
     │
-    └── FOR EACH GAME:
-            └── Task(opus): game-predictor
-                ├── Receives: Full game data from Supabase
-                ├── Has: Full autonomy (can research more if needed)
-                ├── Writes: prediction_log + placed_bets (if BET)
-                └── Returns: Short summary
+    └── FOR EACH GAME (fresh context):
+            │
+            ├── Step 1: Task(haiku) → game-researcher
+            │   ├── WebFetch: Action Network public betting
+            │   ├── WebSearch: Injuries
+            │   ├── WebSearch: Lineups/scratches
+            │   └── Returns: Research JSON (~3-4k tokens)
+            │
+            └── Step 2: Task(opus) → game-predictor
+                ├── Receives: Game data + Research JSON
+                ├── Rates: spread/ML/total confidence (0-100)
+                ├── Decides: BET or PASS
+                ├── Writes: prediction_log + placed_bets
+                └── Returns: Short summary (~8-10k tokens)
 
-            [CONTEXT DISCARDED - next game gets fresh opus]
+            [CONTEXTS DISCARDED - next game fresh]
 
-Key: Each game = fresh context. Full autonomy to research if needed.
+Key: Haiku researches (cheap), Opus decides (quality). ~50% token reduction.
 
 ═══════════════════════════════════════════════════════════════════
                     PHASE 3: SETTLEMENT
@@ -105,295 +117,22 @@ The Supabase MCP is already connected. Use:
 
 ### Tables
 
-#### `games` - Games table (core table)
+| Table | Key Columns | Purpose |
+|-------|-------------|---------|
+| `games` | sport, game_date, away_team, home_team, espn_event_id, status | Core game data |
+| `books` | name, short_name, priority | Sportsbook reference (DK, FD, MGM, CZR) |
+| `game_odds` | game_id, book_id, spread, total, away_ml, home_ml | Current odds per book |
+| `odds_history` | game_id, spread, total, open_spread, open_total, hours_before_game | Line movement snapshots |
+| `game_injuries` | game_id, player_name, team, side, status | Player injury reports (linked to games) |
+| `injury_history` | sport, team, player_name, status, previous_status, first_reported | Tracks when injuries announced + status changes |
+| `game_goalies` | game_id, away_goalie_name, home_goalie_name, *_confirmed, *_gaa, *_sv_pct | NHL starting goalies from DailyFaceoff |
+| `placed_bets` | sport, game_date, bet_type, selection, odds, result, game_context | Immutable bet records |
+| `prediction_log` | game_id, decision (BET/PASS), public_pct, sharp_detected, reasoning, result | All decisions for ML |
+| `odds_history_archive` | game_snapshot (JSONB), recorded_at, spread, open_spread | Preserved odds after game cleanup |
+| `injury_history_archive` | game_snapshot (JSONB), recorded_at, player_name, status | Preserved injuries after game cleanup |
 
-```sql
-CREATE TABLE games (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
+> **Note**: Use `mcp__supabase__list_tables` for full schema. Agents should query `game_analysis_view` which pre-aggregates all data.
 
-  -- Game info
-  sport TEXT NOT NULL,              -- 'NBA', 'NHL', 'NFL', 'NCAAB'
-  game_date DATE NOT NULL,
-  game_time TIMESTAMPTZ,
-  away_team TEXT NOT NULL,
-  home_team TEXT NOT NULL,
-  espn_event_id TEXT,               -- ESPN event ID for JSON API lookups
-
-  -- Status
-  status TEXT DEFAULT 'scheduled',
-  final_score TEXT,
-
-  UNIQUE (sport, game_date, away_team, home_team)
-);
-
--- Index for ESPN event ID lookups
-CREATE INDEX idx_games_espn_event ON games(espn_event_id) WHERE espn_event_id IS NOT NULL;
-```
-
-> **Note**: `espn_event_id` links to ESPN JSON APIs for structured odds data. All odds are stored in `game_odds` table (not in games table).
-
-#### `books` - Sportsbook reference table
-
-```sql
-CREATE TABLE books (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  name TEXT NOT NULL UNIQUE,        -- 'DraftKings', 'FanDuel', etc.
-  short_name TEXT NOT NULL UNIQUE,  -- 'DK', 'FD', 'MGM', 'CZR'
-  is_active BOOLEAN DEFAULT TRUE,
-  priority INTEGER DEFAULT 100      -- Lower = preferred
-);
-
--- Seeded with Big 4:
--- DraftKings (DK), FanDuel (FD), BetMGM (MGM), Caesars (CZR)
-```
-
-#### `game_injuries` - Player injuries linked to games
-
-```sql
-CREATE TABLE game_injuries (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  game_id UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-  player_name TEXT NOT NULL,
-  team TEXT NOT NULL,
-  side TEXT NOT NULL,               -- 'away' or 'home'
-  position TEXT,
-  status TEXT NOT NULL,             -- 'OUT', 'GTD', 'Questionable', 'Doubtful', 'Probable'
-  injury_type TEXT,
-  injury_description TEXT,
-  impact_level TEXT,                -- 'critical', 'high', 'medium', 'low'
-  is_starter BOOLEAN DEFAULT FALSE,
-  source TEXT DEFAULT 'ESPN',
-  UNIQUE(game_id, player_name, team)
-);
-```
-
-#### `game_odds` - Multi-book odds per game
-
-```sql
-CREATE TABLE game_odds (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  updated_at TIMESTAMPTZ DEFAULT NOW(),
-  game_id UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-  book_id UUID NOT NULL REFERENCES books(id),
-  away_ml INTEGER,
-  home_ml INTEGER,
-  spread DECIMAL(4,1),
-  away_spread_odds INTEGER DEFAULT -110,
-  home_spread_odds INTEGER DEFAULT -110,
-  total DECIMAL(5,1),
-  over_odds INTEGER DEFAULT -110,
-  under_odds INTEGER DEFAULT -110,
-  is_current BOOLEAN DEFAULT TRUE,
-  fetched_at TIMESTAMPTZ DEFAULT NOW(),
-  UNIQUE(game_id, book_id)
-);
-```
-
-#### `odds_history` - Line movement tracking
-
-```sql
-CREATE TABLE odds_history (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  recorded_at TIMESTAMPTZ DEFAULT NOW(),
-  game_id UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-  book_id UUID NOT NULL REFERENCES books(id),
-
-  -- Current odds at snapshot time
-  away_ml INTEGER,
-  home_ml INTEGER,
-  spread DECIMAL(4,1),
-  away_spread_odds INTEGER,
-  home_spread_odds INTEGER,
-  total DECIMAL(5,1),
-  over_odds INTEGER,
-  under_odds INTEGER,
-
-  -- Opening line tracking (from ESPN API)
-  is_opening BOOLEAN DEFAULT FALSE,
-  open_spread DECIMAL(4,1),         -- Opening spread from ESPN
-  open_total DECIMAL(5,1),          -- Opening total from ESPN
-  open_away_ml INTEGER,             -- Opening away ML
-  open_home_ml INTEGER,             -- Opening home ML
-
-  -- Metadata
-  source TEXT DEFAULT 'espn_api',   -- 'espn_api', 'webfetch', 'the_odds_api'
-  hours_before_game DECIMAL(6,2),   -- Hours until game when snapshot taken
-  refresh_tier TEXT,                -- 'opening', '72hr', '24hr', '6hr', 'gameday'
-  significant_move BOOLEAN DEFAULT FALSE,  -- Auto-detected significant movement
-  market_event TEXT                 -- 'opening', 'injury_news', 'line_move'
-);
-
--- Trigger auto-detects significant movements (>0.5 spread, >1.0 total, >15 ML)
-```
-
-#### `placed_bets` - Betting history (immutable ground truth)
-
-```sql
-CREATE TABLE placed_bets (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-
-  -- Game info
-  sport TEXT NOT NULL,
-  game_date DATE NOT NULL,
-  game_time TIMESTAMPTZ,
-  away_team TEXT NOT NULL,
-  home_team TEXT NOT NULL,
-
-  -- The bet
-  bet_type TEXT NOT NULL,           -- 'spread', 'total', 'moneyline'
-  selection TEXT NOT NULL,          -- e.g., 'Knicks -2.5', 'Over 228.5', 'Bucks ML'
-  odds INTEGER NOT NULL,            -- American odds
-  book TEXT,
-
-  -- Tracking
-  confidence TEXT,                  -- 'low', 'medium', 'high'
-  reasoning TEXT,
-  system_version TEXT,              -- 'v3-data-lifecycle'
-  game_context JSONB,               -- Snapshot of game state at bet time
-
-  -- Results
-  result TEXT DEFAULT 'PENDING',    -- 'WIN', 'LOSS', 'PUSH', 'PENDING'
-  final_score TEXT,
-  settled_at TIMESTAMPTZ,
-
-  -- Money (optional)
-  stake DECIMAL(10,2),
-  profit DECIMAL(10,2)
-);
-```
-
-> **`game_context`**: Captures full game state at bet time for historical learning:
-> ```json
-> {
->   "odds": {"spread": 3.5, "total": 228.5, "away_ml": -155},
->   "injuries": {"away": [...], "home": [...]},
->   "signals": {"public_pct": 68, "sharp_side": "home"},
->   "line_movement": {"opening_spread": 4.0}
-> }
-> ```
-
-#### `prediction_log` - ALL decisions (BET + PASS) for learning
-
-```sql
-CREATE TABLE prediction_log (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-
-  -- Game reference
-  game_id UUID REFERENCES games(id) ON DELETE SET NULL,
-  sport TEXT NOT NULL,
-  game_date DATE NOT NULL,
-  away_team TEXT NOT NULL,
-  home_team TEXT NOT NULL,
-
-  -- Decision
-  decision TEXT NOT NULL CHECK (decision IN ('BET', 'PASS')),
-
-  -- Structured signals (queryable for ML)
-  public_pct DECIMAL(4,1),           -- e.g., 68.5
-  public_side TEXT,                   -- 'away', 'home', 'split'
-  sharp_detected BOOLEAN DEFAULT FALSE,
-  sharp_side TEXT,                    -- 'away', 'home'
-  rlm_detected BOOLEAN DEFAULT FALSE, -- Reverse line movement
-  goalie_edge TEXT,                   -- 'away', 'home' (NHL only)
-
-  -- Odds at decision time
-  spread DECIMAL(4,1),
-  total DECIMAL(5,1),
-  away_ml INTEGER,
-  home_ml INTEGER,
-
-  -- Link to bet if placed
-  placed_bet_id UUID REFERENCES placed_bets(id) ON DELETE SET NULL,
-
-  -- Reasoning
-  reasoning TEXT NOT NULL,
-  confidence DECIMAL(3,2),            -- 0.00-1.00
-
-  -- Efficiency tracking
-  tokens_used INTEGER,
-  prediction_number INTEGER DEFAULT 1,  -- Tracks re-analyses of same game
-  decision_model TEXT DEFAULT 'opus',
-  system_version TEXT DEFAULT 'v7-isolated'
-
-  -- NOTE: No UNIQUE on game_id - allows re-prediction as lines move
-);
-```
-
-> **Why log PASS decisions?** The system learns from patterns. Knowing WHY we passed (e.g., "public 50/50, no edge") is as valuable as knowing why we bet.
-
-#### `game_public_betting` - Public betting % from multiple sources
-
-```sql
-CREATE TABLE game_public_betting (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  created_at TIMESTAMPTZ DEFAULT NOW(),
-  game_id UUID NOT NULL REFERENCES games(id) ON DELETE CASCADE,
-
-  -- Source tracking (store ALL sources for future arbitrage)
-  source TEXT NOT NULL,  -- 'covers', 'action_network', 'vegas_insider'
-  source_priority INTEGER DEFAULT 100,  -- Lower = more reliable (covers=10)
-
-  -- Spread betting
-  spread_public_pct DECIMAL(4,1),
-  spread_public_side TEXT,  -- 'away' or 'home'
-  spread_money_pct DECIMAL(4,1),
-  spread_money_side TEXT,
-
-  -- Moneyline betting
-  ml_public_pct DECIMAL(4,1),
-  ml_public_side TEXT,
-  ml_money_pct DECIMAL(4,1),
-  ml_money_side TEXT,
-
-  -- Total betting
-  total_public_pct DECIMAL(4,1),
-  total_money_pct DECIMAL(4,1),
-
-  -- Metadata
-  fetched_at TIMESTAMPTZ DEFAULT NOW(),
-  raw_data JSONB,
-
-  UNIQUE(game_id, source)
-);
-```
-
-> **Note**: This table is reserved for a future pipeline. Currently empty because Action Network and Covers use JavaScript rendering (can't be scraped server-side). The `game-predictor` agent can research public betting via WebSearch if needed.
-
-### Schema Relationships
-
-```
-books (reference)
-├── id, name, short_name, priority
-
-games
-├── id, sport, game_date, away_team, home_team, espn_event_id
-├── UNIQUE(sport, game_date, away_team, home_team)
-│
-├──► game_injuries (game_id FK)
-│    └── player_name, team, side, status, impact_level
-│
-├──► game_odds (game_id FK + book_id FK)
-│    └── away_ml, home_ml, spread, total, is_current
-│
-├──► odds_history (game_id FK + book_id FK)
-│    └── recorded_at, is_opening, open_spread, open_total, significant_move
-│
-├──► prediction_log (game_id FK, multiple per game allowed)
-│    └── decision, public_pct, sharp_detected, reasoning, prediction_number
-│
-└──► game_public_betting (game_id FK)
-     └── source, spread_public_pct, ml_public_pct, total_public_pct
-
-placed_bets (standalone - immutable record)
-└──► prediction_log.placed_bet_id (optional link when decision=BET)
-```
 
 ### Views
 
@@ -413,19 +152,16 @@ Returns columns:
 - `line_movement` - Enhanced tracking (JSON object):
   - `opening_spread`, `current_spread`, `spread_change`, `spread_direction`
   - `opening_total`, `current_total`, `total_change`
-  - `snapshots` (count), `significant_moves` (count)
-  - `hours_until_game`, `last_update`
-- `public_betting` - Pre-scraped from Covers/Action Network (JSON array):
-  - `source`, `priority`, `spread_pct`, `spread_side`, `ml_pct`, `total_pct`
+  - `hours_until_game`
 
 ### Functions
 
-#### `cleanup_old_games(days_old INTEGER)`
+#### `cleanup_old_games(days_old INTEGER DEFAULT 7)`
 
-Removes games older than X days with terminal status. Cascades to delete odds, injuries, lineups, history.
+Archives odds and injury history to `*_archive` tables, then removes games older than X days with terminal status. Preserves historical data for ML/backtesting.
 
 ```sql
-SELECT * FROM cleanup_old_games(2);  -- Returns deleted count per sport
+SELECT * FROM cleanup_old_games(7);  -- Returns sport, deleted_count, archived_odds, archived_injuries
 ```
 
 #### `mark_stale_games()`
@@ -436,58 +172,14 @@ Marks games from past dates still marked as 'scheduled' as 'stale'.
 SELECT mark_stale_games();  -- Returns count of games marked stale
 ```
 
-### Example SQL Queries
+### Key Queries
 
 ```sql
--- Get today's games
-SELECT * FROM games
-WHERE game_date = CURRENT_DATE
-ORDER BY sport, game_time;
+-- Primary query for agents (use this!)
+SELECT * FROM game_analysis_view WHERE game_date >= CURRENT_DATE;
 
--- Get games with injuries
-SELECT g.*,
-  json_agg(gi.*) FILTER (WHERE gi.id IS NOT NULL) AS injuries
-FROM games g
-LEFT JOIN game_injuries gi ON g.id = gi.game_id
-WHERE g.game_date = CURRENT_DATE AND g.sport = 'NBA'
-GROUP BY g.id;
-
--- Best odds across all books
-SELECT g.away_team || ' @ ' || g.home_team AS matchup,
-  b.short_name AS book,
-  go.away_ml, go.home_ml, go.spread, go.total
-FROM games g
-JOIN game_odds go ON g.id = go.game_id AND go.is_current = TRUE
-JOIN books b ON go.book_id = b.id
-WHERE g.game_date = CURRENT_DATE
-ORDER BY g.game_time, g.away_team;
-
--- Line movement for a game
-SELECT oh.recorded_at, b.short_name, oh.spread, oh.total,
-  oh.spread - LAG(oh.spread) OVER (ORDER BY oh.recorded_at) AS spread_move
-FROM odds_history oh
-JOIN books b ON oh.book_id = b.id
-WHERE oh.game_id = 'some-game-uuid'
-ORDER BY oh.recorded_at;
-
--- Insert a pick
-INSERT INTO placed_bets (
-  sport, game_date, away_team, home_team,
-  bet_type, selection, odds, confidence, reasoning, system_version
-)
-VALUES (
-  'NBA', '2025-12-29', 'Milwaukee Bucks', 'Charlotte Hornets',
-  'moneyline', 'Bucks ML', -155, 'medium', 'Road favorite with value', 'v1-tree-agent'
-);
-
--- Calculate win rate
-SELECT
-  result,
-  COUNT(*) as count,
-  ROUND(COUNT(*) * 100.0 / SUM(COUNT(*)) OVER (), 1) as pct
-FROM placed_bets
-WHERE result != 'PENDING'
-GROUP BY result;
+-- Win rate
+SELECT result, COUNT(*) FROM placed_bets WHERE result != 'PENDING' GROUP BY result;
 ```
 
 ## Edge Functions
@@ -499,16 +191,16 @@ All Edge Functions can be triggered manually via HTTP POST:
 https://htnhszioyydsjzkqeowx.supabase.co/functions/v1/{function-name}
 ```
 
-### `refresh-odds` - Automated Odds Refresh
+### `refresh-odds` - Automated Odds + Injuries + Goalies (v12)
 
-Fetches ESPN JSON APIs and updates odds in Supabase.
+**Atomic data capture**: Fetches odds, injuries, and goalies in a single function call so all data has the same timestamp. This enables line movement correlation with injury announcements.
 
 **Endpoint**: `https://htnhszioyydsjzkqeowx.supabase.co/functions/v1/refresh-odds`
 
 **Parameters**:
 ```json
 {
-  "tier": "opening" | "72hr" | "24hr" | "6hr" | "gameday" | "all",
+  "tier": "opening" | "72hr" | "24hr" | "gameday",
   "sport": "NBA" | "NHL" | "NFL" | "NCAAB",  // optional
   "force": true  // skip schedule checks
 }
@@ -522,34 +214,32 @@ curl -X POST https://htnhszioyydsjzkqeowx.supabase.co/functions/v1/refresh-odds 
 ```
 
 **What it does**:
-1. Fetches ESPN scoreboard for event IDs
-2. Fetches ESPN odds API per event (structured JSON, not HTML)
-3. Upserts to `game_odds` (current odds)
-4. Inserts to `odds_history` (line movement tracking)
+1. **Phase 1 - Odds**: Fetches ESPN scoreboard → ESPN odds API → upserts `game_odds` + `odds_history`
+2. **Phase 2 - Injuries**: Fetches ESPN injuries API → upserts `game_injuries` + `injury_history`
+3. **Phase 3 - Goalies** (NHL only): Fetches DailyFaceoff `__NEXT_DATA__` → upserts `game_goalies`
 
-### `refresh-injuries` - Injury Scraper
-
-Scrapes ESPN injury pages (HTML) and links injuries to upcoming games.
-
-**Endpoint**: `https://htnhszioyydsjzkqeowx.supabase.co/functions/v1/refresh-injuries`
-
-**Parameters**:
+**Sample response**:
 ```json
 {
-  "sport": "NBA" | "NHL" | "NFL" | "NCAAB"  // optional, defaults to all
+  "summary": {
+    "total": 17,
+    "updated": 17,
+    "injuries": { "fetched": 61, "updated": 209, "newReports": 61 },
+    "goalies": { "fetched": 4, "updated": 4 }
+  }
 }
 ```
 
-**Manual trigger**:
-```bash
-curl -X POST https://htnhszioyydsjzkqeowx.supabase.co/functions/v1/refresh-injuries
-```
+### `refresh-injuries` - DEPRECATED (Replaced)
 
-**What it does**:
-1. Fetches ESPN injury pages (HTML scraping)
-2. Parses player names, status, injury type
-3. Matches injuries to upcoming games (next 7 days)
-4. Upserts to `game_injuries` table
+~~Old HTML scraper - broken when ESPN changed their page structure.~~
+
+**Status**: Replaced by integrated injury fetching in `refresh-odds` v11. The Edge Function still exists but is not scheduled.
+
+**New approach**: ESPN has a JSON injuries API that works reliably:
+```
+https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/injuries
+```
 
 ### `settle-games` - Game Settlement
 
@@ -592,8 +282,7 @@ Automated scheduled refreshes via Supabase pg_cron:
 | `refresh-72hr` | Every 6 hours | `refresh-odds` | Games 2-3 days out |
 | `refresh-24hr` | Every 2 hours | `refresh-odds` | Games tomorrow |
 | `refresh-gameday` | Every 30 min | `refresh-odds` | Today's games |
-| `refresh-injuries` | Every 2 hours | `refresh-injuries` | Update injury reports |
-| `settle-games` | 8pm/10pm/midnight UTC | `settle-games` | Settlement checks |
+| `settle-games` | 6am/8am/10am UTC | `settle-games` | Settlement checks |
 
 **Check cron status**:
 ```sql
@@ -609,12 +298,24 @@ Structured JSON endpoints (no HTML scraping needed):
 |-----|-------------|
 | Scoreboard | `https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard?dates=YYYYMMDD` |
 | Odds | `https://sports.core.api.espn.com/v2/sports/{sport}/leagues/{league}/events/{EVENT_ID}/competitions/{EVENT_ID}/odds` |
+| Injuries | `https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/injuries` |
 
 **Sport paths**:
 - NBA: `basketball/nba`
 - NHL: `hockey/nhl`
 - NFL: `football/nfl`
-- NCAAB: `basketball/mens-college-basketball`
+- NCAAB: `basketball/mens-college-basketball` (injuries returns empty)
+
+## DailyFaceoff API
+
+NHL goalie data extracted from `__NEXT_DATA__` JSON embedded in HTML:
+
+| Data | URL |
+|------|-----|
+| Starting Goalies | `https://www.dailyfaceoff.com/starting-goalies/` |
+| Line Combinations | `https://www.dailyfaceoff.com/teams/{team-slug}/line-combinations` |
+
+**Goalie confirmation levels**: `Confirmed`, `Probable`, `Unconfirmed`
 
 ## Skills Reference
 
@@ -627,66 +328,62 @@ Structured JSON endpoints (no HTML scraping needed):
 
 ## Agents Reference
 
-| Agent | Purpose |
-|-------|---------|
-| `refresh-orchestrator` | Calls Edge Function or ESPN JSON APIs, updates Supabase |
-| `game-predictor` | Fresh opus per game - full autonomy on analysis, writes BET/PASS to database |
+| Agent | Model | Purpose |
+|-------|-------|---------|
+| `refresh-orchestrator` | - | Calls Edge Function or ESPN JSON APIs, updates Supabase |
+| `game-researcher` | Haiku | WebFetch Action Network (bet%) + SportsBettingDime (money%) + WebSearch injuries/lineups |
+| `game-predictor` | Opus | Receives research JSON, rates confidence (0-100) per bet type, makes BET/PASS decision |
 
 ## Key Design Decisions
 
 | Decision | Choice | Why |
 |----------|--------|-----|
-| Two-phase system | Refresh → Predict | Clean separation, no duplicate fetching |
-| Injuries in Supabase | Pre-fetched | No cross-sport contamination during prediction |
-| Fresh opus per game | Task(opus) agent | Each game gets clean context, no accumulation |
-| Public betting | Agent autonomy | No reliable server-side source; agent can WebSearch if needed |
+| Split agents | Haiku researches, Opus decides | Cost efficiency + quality decisions |
+| Inline research | WebFetch + WebSearch per game | Always fresh data, no stale cron |
+| Dual betting sources | Action Network (bet%) + SportsBettingDime (money%) | Sharp detection via divergence |
+| Fresh context per game | Task agents discarded after each game | No context bleed between games |
 | Log ALL decisions | prediction_log table | Learning requires knowing why we passed, not just bet |
-| Full autonomy | No rigid rules | Claude can research more if needed, find obscure edges |
-| Conservative defaults | PASS when uncertain | Better to miss edges than make bad bets |
+| Full autonomy | No rigid rules | Agent decides when to bet based on its own analysis |
 | Re-prediction allowed | No UNIQUE on game_id | Can re-analyze as lines move |
 
 ## Decision Philosophy
 
-**Claude's reasoning backed by verified data, not rigid rules.**
+**Full autonomy - no guardrails.**
 
-Reference patterns (starting points, not constraints):
-- Public >65% + sharp opposite → Fade opportunity
-- Public + key injury on public side → Fade with conviction
-- NHL backup goalie on public side → Goalie edge
+The agent receives game data, does research, and makes its own BET/PASS decision. No prescribed thresholds, no forced PASS conditions, no "safe" defaults.
 
-Claude's freedom:
-- Can find edges not in patterns above
-- Can BET even if sharp/public aligned (if reasoning supports it)
-- Can PASS on "obvious" patterns if something feels off
+- Missing public data? Analyze anyway with available signals.
+- Signals conflict? Make a judgment call.
+- Uncertain? Bet and learn from the outcome.
 
-Conservative default: **PASS when no clear edge** - but reason with whatever signals are available
+All decisions logged to `prediction_log` for learning. The agent develops intuition through experience, not rules.
 
 ## Data Sources
 
-| Source | Used For | URL |
-|--------|----------|-----|
-| ESPN Scoreboard API | Event IDs, game times | `site.api.espn.com/apis/site/v2/sports/{sport}/{league}/scoreboard` |
-| ESPN Odds API | Lines, odds, opening lines | `sports.core.api.espn.com/.../events/{id}/.../odds` |
-| ESPN Injuries (HTML) | Injury reports | espn.com/{sport}/injuries |
-| Action Network | Public betting %, sharp reports | actionnetwork.com |
-| Covers | Consensus picks, public % | covers.com |
-| X/Twitter | Sharp commentary | x.com |
-| Reddit | Community sentiment | reddit.com/r/sportsbook |
+| Source | Used For | Frequency | URL |
+|--------|----------|-----------|-----|
+| ESPN Scoreboard API | Event IDs, game times | Every cron | `site.api.espn.com/.../scoreboard` |
+| ESPN Odds API | Lines, odds, opening lines | Every cron | `sports.core.api.espn.com/.../odds` |
+| ESPN Injuries API | Injury status, return dates | Every cron | `site.api.espn.com/.../injuries` |
+| DailyFaceoff | NHL starting goalies, stats | Every cron (NHL) | `dailyfaceoff.com/starting-goalies/` |
+| Action Network | Public bet % (tickets) | Per-game (agent) | `actionnetwork.com/{sport}/public-betting` |
+| SportsBettingDime | Money % (handle) for sharp detection | Per-game (agent) | `sportsbettingdime.com/{sport}/public-betting-trends` |
+| WebSearch | Late scratches, GTD updates | Per-game (agent) | Dynamic |
 
 ## For LLM Assistants
 
 When helping with this project:
 
-1. **Automated refresh**: pg_cron handles odds updates automatically (every 30 min gameday)
-2. **Use the view**: Query `game_analysis_view` instead of complex JOINs
-3. **Data is local**: Odds and injuries are in Supabase (pre-fetched by Edge Functions)
-4. **Fresh opus per game**: `/predict` spawns a fresh `game-predictor` agent for each game
-5. **Full autonomy**: Each game-predictor can use Supabase data or research more (WebSearch)
-6. **Public betting**: Not pre-fetched (no reliable source). Agent can WebSearch if needed.
-7. **Log ALL decisions**: Write to `prediction_log` for both BET and PASS (learning needs both)
-8. **System version**: Tag decisions with `v8-simplified` for tracking
-9. **Re-prediction OK**: Games can be re-analyzed (no UNIQUE constraint) - useful for line movement
-10. **Token budget**: ~4k orchestrator for 10 games (summaries only accumulate)
+1. **Automated refresh**: pg_cron handles odds + injuries + goalies every 30 min (gameday)
+2. **Use the view**: Query `game_analysis_view` - aggregates odds, injuries, line movement
+3. **Check new tables**: `game_goalies` for NHL starters, `injury_history` for tracking
+4. **Opus-only prediction**: Each game gets a fresh Opus agent
+5. **Inline research for live data**: Agent does 2-3 WebSearches per game:
+   - Public betting (Action Network + SportsBettingDime)
+   - Late scratches/GTD updates (supplements cron data)
+6. **Log ALL decisions**: Write to `prediction_log` for BET and PASS
+7. **System version**: Tag decisions with `v15-data-validation`
+8. **Token efficiency**: Fresh Opus context discarded per game
 
 ## File Structure
 
@@ -711,101 +408,105 @@ supa_bet/
     │
     └── agents/
         ├── refresh-orchestrator/AGENT.md   # ESPN JSON API coordinator
-        └── game-predictor/AGENT.md         # Fresh opus per game, full autonomy
+        └── game-predictor/AGENT.md         # Opus decision maker (does inline public betting research)
 ```
 
-## Migration Status
+## Known Issues & Tasks
 
-### Phase 1: Migrate Existing Data ✅ COMPLETE (2025-12-29)
-Legacy odds migrated from `games` table to normalized structure:
-- `game_odds`: 29 rows (DraftKings odds)
-- `odds_history`: 29 rows (opening lines)
+### P0 - Critical (blocks core feature)
 
-### Phase 2: Update Agents ✅ COMPLETE (2025-12-29)
-- [x] `refresh-orchestrator` - Now writes to `game_odds`, `odds_history`, `game_injuries`
-- [x] `predict-orchestrator` - Now uses `game_analysis_view` + saves `game_context`
+- [x] **Fix spread sign convention** in `refresh-odds/index.ts` - FIXED 2026-01-02 (v12)
+  - Now uses `item.awayTeamOdds?.current?.pointSpread?.american` (signed) instead of `item.spread` (unsigned)
+  - Historical data before 2026-01-02 has sign mismatch (deferred correction)
+- [x] **Fix is_opening logic** - FIXED 2026-01-02 (v12)
+  - Now checks if history exists before marking `is_opening=true`
+  - Backfilled 173 games with proper opening line flags
 
-### Phase 3: Data Lifecycle ✅ COMPLETE (2025-12-29)
-- [x] `game_context` JSONB column in `placed_bets` for historical learning
-- [x] `game_analysis_view` for simplified agent data access
-- [x] `cleanup_old_games()` + `mark_stale_games()` functions
-- [x] `/settle-bets` skill for results checking
+### P1 - Important (data quality)
 
-### Phase 4: Automated Data Pipeline ✅ COMPLETE (2025-12-30)
-- [x] ESPN JSON APIs (structured data, no HTML scraping for odds)
-- [x] `espn_event_id` column in `games` table
-- [x] `refresh_schedules` table for tier-based refresh tracking
-- [x] Enhanced `odds_history` with opening lines, source, hours_before_game
-- [x] `refresh-odds` Edge Function deployed
-- [x] `refresh-injuries` Edge Function deployed (ESPN HTML scraping)
-- [x] `settle-games` Edge Function deployed (updates games + placed_bets)
-- [x] pg_cron + pg_net extensions enabled
-- [x] 6 scheduled cron jobs for automated refresh
-- [x] `game_analysis_view` enhanced with line movement tracking
-- [x] `/discover-games` skill for finding games 3-7 days out
+- [x] **Fix timezone handling** for game_time filtering - FIXED 2026-01-02
+  - Added `game_time_utc` TIMESTAMPTZ column to `games` table
+  - Updated `game_analysis_view` to use proper UTC calculation
+  - Edge Function v12 writes to `game_time_utc`
+- [x] **Add unique constraint** on placed_bets - FIXED 2026-01-02
+  - Added `(game_date, away_team, home_team, bet_type, selection)` unique constraint
+- [x] **Make prediction_log.game_id NOT NULL** - FIXED 2026-01-02
+  - All predictions must link to a game for analytics
+- [x] **Add game_id to injury_history** - FIXED 2026-01-02
+  - Enables correlation of injury announcements to line movements
+  - Edge Function v12 populates game_id when matching games
+- [x] **Link prediction_log to outcomes** - FIXED 2026-01-03 (settle-games v3)
+  - Added `result` column to `prediction_log` table (WIN/LOSS/PUSH, NULL for PASS)
+  - `settle-games` Edge Function now updates `prediction_log.result` when settling bets
+  - Backfilled 19 historical predictions (13 WIN, 6 LOSS)
+- [x] **settle-games Edge Function team abbreviation matching** - FIXED 2026-01-03 (v2)
+  - **Root cause**: `determineBetResult()` used word matching that failed for abbreviations (BKN, CLE, PHX, NYR, MIN)
+  - **Fix**: Added `TEAM_ABBREVIATIONS` mapping (~80 teams: NBA, NHL, NFL, NCAAB) and `selectionMatchesTeam()` helper
+  - **Affected bets**: BKN -1.5, CLE -13.5, PHX -12.5, NYR +1.5, MIN ML (manually settled before fix deployed)
 
-### Phase 4.5: Schema Cleanup ✅ COMPLETE (2025-12-30)
-- [x] Dropped legacy odds columns from `games` table (`away_ml`, `home_ml`, `spread`, `total`, `book`)
-- [x] All odds now exclusively in `game_odds` table
-- [x] Updated CLAUDE.md documentation
+### P2 - Valuable (ML prep)
 
-### Phase 5: Simplification ✅ COMPLETE (2025-12-30)
-- [x] Dropped unused tables: `game_lineups`, `refresh_schedules`
-- [x] Consolidated 5 agents → 1 unified `sports-researcher`
-- [x] Single game per `/predict` invocation (fresh context, no batch)
-- [x] Consistent reasoning format for future pattern matching
-- [x] Updated `game_analysis_view` (removed goalies, refresh_info)
+- [ ] **Team name normalization** - Create canonical teams/aliases tables for reliable matching
+- [ ] **Backfill spread data** - Attempt programmatic correction of pre-2026-01-02 records
+- [ ] **Multi-book odds** - Track FanDuel, BetMGM, Caesars in addition to DraftKings
+- [ ] **Create analytics view** showing prediction accuracy by confidence bucket
+- [ ] **Track model version performance** - compare v10 vs v11 vs v12 win rates separately
+- [ ] **Add feature columns** to prediction_log (opening_spread, spread_movement, etc.)
 
-### Phase 5.5: Timezone Fix ✅ COMPLETE (2025-12-30)
-- [x] Fixed `refresh-odds` Edge Function: `game_date` now uses US Eastern time (not UTC)
-- [x] Added `getLocalDate()` helper using `Intl.DateTimeFormat` with `America/New_York`
-- [x] Corrected 128 existing games with wrong dates via SQL update
-- [x] Games now store correct local date for historical tracking
+### P3 - Nice to have
 
-### Phase 6: Efficient Prediction ✅ COMPLETE (2025-12-30)
-- [x] Created `prediction_log` table for ALL decisions (BET + PASS)
-- [x] Haiku→Opus flow: haiku for cheap research, opus for reasoning
-- [x] Parallel haiku agents for public betting + sharp action
-- [x] 87% token reduction (39k → ~5k per game)
-- [x] Flexible decision philosophy (guidelines not rigid rules)
-- [x] Updated `/predict` skill for efficient flow
-- [x] Structured signals (public_pct, sharp_detected) for future ML
+- [ ] **Alerting** for settlement failures or big line moves
+- [ ] **Backtesting framework** for strategy iteration
+- [x] **Investigate injuries** - RESOLVED: Now using ESPN JSON injuries API via cron (not WebSearch)
 
-### Phase 7: Isolated Prediction ✅ COMPLETE (2025-12-30)
-- [x] Fresh opus agent per game (no context accumulation)
-- [x] `game_public_betting` table for pre-scraped public betting data
-- [x] `game-predictor` agent with full autonomy
-- [x] Removed UNIQUE on prediction_log.game_id (allows re-prediction)
-- [x] Added `prediction_number` column for tracking re-analyses
-- [x] Updated `game_analysis_view` with public_betting column
-- [x] Edge Function scrapes Covers for public betting (placeholder for HTML parsing)
-- [x] Deleted old files: sports-researcher, public-betting, social-sentiment skills
+## Future Enhancements
 
-### Phase 8: Future Enhancements
-- [x] ~~Implement Covers HTML parsing in Edge Function~~ (BLOCKED: Covers uses JS rendering)
-- [x] ~~Add Action Network scraping~~ (BLOCKED: Action Network uses JS rendering)
-- [ ] Multi-book odds (FanDuel, BetMGM, Caesars via OddsJam/Covers)
-- [ ] Lineup scraper (RotoWire, DailyFaceoff for NHL goalies)
-- [ ] Push notifications for significant line movements
-- [ ] Historical backfill of odds data
+- [ ] Multi-book odds (FanDuel, BetMGM, Caesars)
+- [x] NHL goalie lineup checking (via inline WebSearch)
 - [ ] ML pattern matching on prediction_log
-- [ ] Find server-rendered public betting source (or API)
+- [ ] Push notifications for significant line movements
 
-## Version History
+## Audit Summary (2026-01-02)
 
-| Version | Date | Description |
-|---------|------|-------------|
-| `v1-tree-agent` | 2025-12-28 | Initial hierarchical agent system with LATM verification |
-| `v2-data-layer` | 2025-12-29 | Normalized schema: `game_odds`, `odds_history`, `game_injuries` tables active |
-| `v3-data-lifecycle` | 2025-12-29 | Game lifecycle: `game_analysis_view`, `game_context`, `/settle-bets`, cleanup functions |
-| `v4-automation` | 2025-12-30 | Automated pipeline: ESPN JSON APIs, Edge Function, pg_cron scheduling, line movement tracking |
-| `v5-simplified` | 2025-12-30 | Simplified agents: 5→1 unified researcher, one game per invocation, dropped dead schema |
-| `v5.5-timezone` | 2025-12-30 | Fixed Edge Function timezone: game_date now uses US Eastern time for accurate historical tracking |
-| `v6-efficient` | 2025-12-30 | Haiku→Opus flow: 87% token reduction, `prediction_log` for all decisions, flexible reasoning philosophy |
-| `v7-isolated` | 2025-12-30 | Fresh opus per game: no context accumulation, `game_public_betting` table, full autonomy, re-prediction allowed |
-| `v7.1-agent-fetch` | 2025-12-30 | Public betting fetched by game-predictor agent (Action Network uses JS, can't pre-scrape) |
-| `v7.2-optimized` | 2025-12-30 | Two-phase /predict: parallel haiku fetchers → Supabase, then fresh opus per game. 80% fewer fetches. |
-| `v8-simplified` | 2025-12-31 | Removed broken public-betting-fetcher. Single-phase /predict. Agent autonomy for research. |
+**Overall Grade: B-** (solid foundation, one critical bug)
+
+| Metric | Value |
+|--------|-------|
+| Games tracked | 293 |
+| ESPN ID match rate | 92% |
+| Odds history entries | 5,685 |
+| Prediction log entries | 68 |
+| Settled win rate | **77%** (10W/3L) |
+| BET rate | 28% (19/68) |
+
+**Key finding**: Early 77% win rate suggests real edge detection, but RLM feature broken due to sign bug.
+
+## Version
+
+**Current**: `v16-prediction-tracking` (2026-01-03)
+- **FIXED**: `settle-games` v3 - team abbreviation matching (BKN, CLE, PHX, NYR, MIN now work)
+- **FIXED**: `settle-games` v3 - now updates `prediction_log.result` when settling bets
+- **NEW**: `prediction_log.result` column tracks WIN/LOSS/PUSH for BET decisions
+- Edge Function: `settle-games` v3 with abbreviation mapping + prediction tracking
+
+**Previous**: `v15-data-validation` (2026-01-02)
+- **FIXED**: Spread sign convention - now uses signed `awayTeamOdds.current.pointSpread.american`
+- **FIXED**: Timezone handling - new `game_time_utc` TIMESTAMPTZ column, view uses proper UTC calculation
+- **FIXED**: `is_opening` logic - checks if history exists before marking (173 games backfilled)
+- **NEW**: Archive tables (`odds_history_archive`, `injury_history_archive`) preserve data after cleanup
+- **NEW**: `cleanup_old_games()` archives before delete, 7-day default retention
+- **NEW**: `injury_history.game_id` links injuries to specific games for RLM correlation
+- **NEW**: Unique constraint on `placed_bets` prevents duplicate bets
+- **NEW**: `prediction_log.game_id` is now NOT NULL (required)
+- Edge Function: `refresh-odds` v12 with all data validation fixes
+- Sharp detection: bet% vs money% differential from Action Network + SportsBettingDime
+- Split architecture: Haiku researches, Opus decides
+- Per-bet-type confidence: Rates spread/ML/total 0-100 separately
+
+**Previous**: `v14-atomic-data` (2025-12-29)
+- Atomic data capture - odds + injuries + goalies fetched together
+- `injury_history` table tracks when injuries are first reported + status changes
+- `game_goalies` table stores NHL starting goalies from DailyFaceoff
 
 ---
 
