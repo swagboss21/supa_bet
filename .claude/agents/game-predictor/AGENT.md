@@ -20,7 +20,7 @@ Pre-fetched data provided in your prompt:
 | `game_id` | Orchestrator | Database game ID |
 | `sport` | game_analysis_view | NBA, NHL, or NCAAB |
 | `away_team`, `home_team` | game_analysis_view | Team names |
-| `game_date`, `game_time` | game_analysis_view | When the game is |
+| `game_date`, `game_time_local` | game_analysis_view | When the game is (Eastern Time) |
 | `odds` | game_analysis_view | Current spread, ML, total |
 | `line_movement` | game_analysis_view | Opening vs current lines |
 | `injuries` | game_analysis_view | From database (may be stale) |
@@ -81,57 +81,46 @@ For each available bet, assign a confidence score:
 
 ---
 
-## Database Writes
+## Database Write
 
-### ALWAYS write to prediction_log:
+### Single INSERT to prediction_log (handles both BET and PASS):
 
 ```sql
 INSERT INTO prediction_log (
-  game_id, sport, game_date, away_team, home_team,
+  game_id,
   decision,
   spread_confidence, moneyline_confidence, total_confidence,
-  best_bet_type, confidence,
+  best_bet_type,
   public_pct, public_side,
   sharp_detected, sharp_side,
   rlm_detected,
   spread, total, away_ml, home_ml,
+  -- Bet details (NULL if PASS)
+  bet_type, selection, odds,
+  game_context,
   reasoning,
   system_version
 )
 VALUES (
-  '[game_id]', '[sport]', '[game_date]', '[away_team]', '[home_team]',
+  '[game_id]',
   '[BET or PASS]',
   [spread_confidence 0-100], [moneyline_confidence 0-100], [total_confidence 0-100],
-  '[spread/moneyline/total or NULL]', [highest_confidence / 100.0],
+  '[spread/moneyline/total or NULL]',
   [public_pct or NULL], '[away/home/split or NULL]',
   [true/false], '[away/home or NULL]',
   [true/false],
   [spread], [total], [away_ml], [home_ml],
+  -- If BET: fill these. If PASS: use NULL
+  '[spread/moneyline/total]',  -- bet_type
+  '[e.g., DET -2.5 or Over 233.5 or DET ML]',  -- selection
+  [american odds for this bet],  -- odds (e.g., -110)
+  '[game_context JSON]'::jsonb,
   '[Short reasoning - 1-2 sentences]',
-  'v12-split-agents'
+  'v20-unified-predictions'
 );
 ```
 
-### If BET, ALSO write to placed_bets:
-
-```sql
-INSERT INTO placed_bets (
-  sport, game_date, game_time, away_team, home_team,
-  bet_type, selection, odds,
-  confidence, reasoning, system_version,
-  game_context
-)
-VALUES (
-  '[sport]', '[game_date]', '[game_time]', '[away_team]', '[home_team]',
-  '[spread/moneyline/total]',
-  '[e.g., DET -2.5 or Over 233.5 or DET ML]',
-  [american odds for this bet],
-  [confidence / 100.0],
-  '[Reasoning]',
-  'v12-split-agents',
-  '[game_context JSON]'::jsonb
-);
-```
+**If PASS**: Set `bet_type`, `selection`, `odds` to NULL. Still capture `game_context`.
 
 **game_context** should capture research findings:
 ```json

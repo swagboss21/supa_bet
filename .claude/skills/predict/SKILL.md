@@ -28,7 +28,7 @@ allowed-tools: Read, WebSearch, WebFetch, Task, mcp__supabase__execute_sql
                 ├── Receives: Game data + Research JSON
                 ├── Rates: spread/ML/total confidence (0-100)
                 ├── Decides: BET or PASS
-                ├── Writes: prediction_log + placed_bets
+                ├── Writes: prediction_log (single table for all decisions)
                 └── [Context discarded]
 
     [Next game starts with completely fresh context]
@@ -54,7 +54,11 @@ ORDER BY game_time;
 **Filters:**
 - Today only (not future days)
 - Has betting odds (skip exhibitions)
-- Hasn't started yet
+- Hasn't started yet (game_time is UTC TIMESTAMPTZ)
+
+**Columns available:**
+- `game_time` - UTC timestamp (for filtering/comparisons)
+- `game_time_local` - Eastern Time (for display to user)
 
 If no results: "No games to analyze. Run /refresh-games to update."
 
@@ -96,7 +100,7 @@ Task(opus, subagent_type='game-predictor'):
 Game: {away_team} @ {home_team}
 Sport: {sport}
 Date: {game_date}
-Time: {game_time}
+Time: {game_time_local}
 Game ID: {game_id}
 
 GAME DATA:
@@ -166,4 +170,4 @@ No edge - public 52/48, lines stable
 
 ## Version
 
-`v12-split-agents` - Haiku research → Opus decision, per-bet-type confidence (0-100)
+`v20-unified-predictions` - Single prediction_log table, Haiku research → Opus decision

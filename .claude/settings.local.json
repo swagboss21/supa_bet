@@ -28,7 +28,16 @@
       "WebFetch(domain:actionnetwork.com)",
       "WebFetch(domain:www.covers.com)",
       "Bash(git log:*)",
-      "Bash(cat:*)"
+      "Bash(cat:*)",
+      "Bash(mcp__supabase__execute_sql:*)",
+      "Bash(mcp__supabase__list_edge_functions)",
+      "WebFetch(domain:htnhszioyydsjzkqeowx.supabase.co)",
+      "Bash(ls:*)",
+      "WebFetch(domain:www.actionnetwork.com)"
     ]
-  }
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "supabase"
+  ]
 }

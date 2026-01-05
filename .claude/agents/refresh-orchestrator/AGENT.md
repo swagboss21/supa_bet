@@ -64,19 +64,28 @@ The response includes:
 - `awayTeamOdds.open.spread` - Opening spread (for line movement)
 - `open.overUnder` - Opening total
 
-### Step 3: Fetch Injury Pages (HTML fallback)
+### Step 3: Fetch Injuries (JSON API)
 
-Injury data is not in the JSON APIs. Use WebFetch to scrape:
+ESPN has JSON injury APIs (no HTML scraping needed):
 
-1. **NBA**: `https://www.espn.com/nba/injuries`
-2. **NHL**: `https://www.espn.com/nhl/injuries`
-3. **NFL**: `https://www.espn.com/nfl/injuries`
-4. **NCAAB**: `https://www.espn.com/mens-college-basketball/injuries`
+```
+https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/injuries
+```
 
-For each team playing today, extract:
-- Player name
-- Status (Out, Doubtful, Questionable, Probable, GTD)
-- Injury description (optional)
+| Sport | Path |
+|-------|------|
+| NBA | basketball/nba |
+| NHL | hockey/nhl |
+| NFL | football/nfl |
+| NCAAB | basketball/mens-college-basketball (returns empty) |
+
+The response includes:
+- `items[].athlete.displayName` - Player name
+- `items[].status` - Out, Day-To-Day, Injured Reserve, etc.
+- `items[].athlete.team.abbreviation` - Team code
+- `items[].details.type` - Injury type
+
+**Note:** The `refresh-odds` Edge Function handles this automatically.
 
 ### Step 4: Update Supabase (Normalized Schema)
 
@@ -84,6 +93,7 @@ Use `mcp__supabase__execute_sql` to update tables:
 
 **Step 4a: Upsert game with ESPN event ID**
 ```sql
+-- game_time is TIMESTAMPTZ (UTC). Use ISO format with Z suffix.
 INSERT INTO games (sport, game_date, game_time, away_team, home_team, espn_event_id, status)
 VALUES ('NBA', '2025-12-29', '2025-12-29T19:00:00Z', 'Milwaukee Bucks', 'Charlotte Hornets', '401810302', 'scheduled')
 ON CONFLICT (sport, game_date, away_team, home_team)

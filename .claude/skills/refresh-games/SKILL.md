@@ -67,11 +67,13 @@ Returns structured JSON with:
 - Current spread, total, moneylines
 - Opening lines for line movement tracking
 
-### Injuries (HTML scrape still required)
-- NBA: `https://www.espn.com/nba/injuries`
-- NHL: `https://www.espn.com/nhl/injuries`
-- NFL: `https://www.espn.com/nfl/injuries`
-- NCAAB: `https://www.espn.com/mens-college-basketball/injuries`
+### Injuries (JSON API - automated via Edge Function)
+```
+https://site.api.espn.com/apis/site/v2/sports/{sport}/{league}/injuries
+```
+- Fetched automatically by `refresh-odds` Edge Function
+- Updates `game_injuries` and `injury_history` tables
+- NCAAB returns empty (no data available from ESPN)
 
 ## Data Flow
 

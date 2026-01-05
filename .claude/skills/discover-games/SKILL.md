@@ -80,6 +80,7 @@ WHERE sport = 'NBA'
 
 For new games, insert with ESPN event ID:
 ```sql
+-- game_time is TIMESTAMPTZ (UTC). Use ISO format with Z suffix.
 INSERT INTO games (sport, game_date, game_time, away_team, home_team, espn_event_id, status)
 VALUES ('NBA', '2025-01-01', '2025-01-01T19:30:00Z', 'Boston Celtics', 'Miami Heat', '401810350', 'scheduled')
 ON CONFLICT (sport, game_date, away_team, home_team)
